@@ -1,5 +1,5 @@
 /* ============================================
-   Clash of Armored - Game Loop (Full Integrated)
+   Clash of Armored - Full Game Loop with Combat
    ============================================ */
 window.addEventListener('DOMContentLoaded', () => {
   const canvas = document.getElementById('gameCanvas');
@@ -7,12 +7,10 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const ctx = canvas.getContext('2d');
 
-  // ===== قراءة الإعدادات =====
   const cfg = window.GAME_CONFIG || { display: {}, performance: {} };
   const controls = window.CONTROLS_CONFIG || { sensitivity: {}, keyboard: {} };
   const mapCfg = (window.MAP_CONFIG && window.MAP_CONFIG.map_01) || {};
 
-  // ===== ضبط الحجم ليملأ الشاشة =====
   function resize() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
@@ -20,33 +18,39 @@ window.addEventListener('DOMContentLoaded', () => {
   resize();
   window.addEventListener('resize', resize);
 
-  // ===== تطبيق حد DPR لأداء أفضل =====
   const dprCap = (cfg.display && cfg.display.pixelRatioCap) || 2;
   const dpr = Math.min(window.devicePixelRatio || 1, dprCap);
   ctx.scale(dpr, dpr);
 
-  // ===== إنشاء الخريطة والمدرعة =====
+  // ===== إنشاء الأنظمة =====
   const map = new TestMap(canvas.width, canvas.height);
+  const combat = new CombatSystem();
 
-  // نقطة الظهور من map-config.js
-  const spawn = mapCfg.playerSpawn || {
-    x: canvas.width / 2 - 25,
-    y: canvas.height / 2 - 35,
-    rotation: 0
-  };
-
+  const spawn = mapCfg.playerSpawn || { x: canvas.width / 2 - 25, y: canvas.height / 2 - 35, rotation: 0 };
   const tank = new Tank(spawn.x, spawn.y);
   tank.rotation = spawn.rotation || 0;
 
-  // ===== حالة الإدخال =====
+  // العقبات من الإعدادات
+  const obstacles = (mapCfg.obstacles || []).slice();
+
+  // الأعداء من الإعدادات
+  const enemies = (mapCfg.enemySpawns || []).map(s => new Enemy(s.x, s.y, s.type));
+
+  // القذائف
+  let projectiles = [];
+  let fireCooldown = 0;
+  const FIRE_INTERVAL = 30; // إطارات بين كل طلقة (0.5 ثانية)
+
+  // حالة اللعبة
+  let gameState = 'playing'; // 'playing' | 'win' | 'lose'
+  let explosions = [];       // تأثيرات الانفجار
+
+  // ===== الإدخال =====
   const input = { up: false, down: false, left: false, right: false, fire: false };
 
-  // ===== لوحة المفاتيح =====
   const kb = controls.keyboard || {
-    up: ['ArrowUp', 'w', 'W'],
-    down: ['ArrowDown', 's', 'S'],
-    left: ['ArrowLeft', 'a', 'A'],
-    right: ['ArrowRight', 'd', 'D'],
+    up: ['ArrowUp', 'w', 'W'], down: ['ArrowDown', 's', 'S'],
+    left: ['ArrowLeft', 'a', 'A'], right: ['ArrowRight', 'd', 'D'],
     fire: ['Space', ' ']
   };
 
@@ -70,15 +74,13 @@ window.addEventListener('DOMContentLoaded', () => {
     if (matchKey(kb.fire, e.key))  input.fire = false;
   });
 
-  // ===== أزرار اللمس على الشاشة =====
+  // أزرار اللمس
   document.querySelectorAll('[data-dir]').forEach(btn => {
     const dir = btn.getAttribute('data-dir');
     const set = (v) => (e) => {
       e.preventDefault();
       input[dir] = v;
-      // اهتزاز عند الضغط
-      if (v && controls.touch && controls.touch.vibrationMs &&
-          navigator.vibrate) {
+      if (v && controls.touch && controls.touch.vibrationMs && navigator.vibrate) {
         navigator.vibrate(controls.touch.vibrationMs);
       }
     };
@@ -89,9 +91,23 @@ window.addEventListener('DOMContentLoaded', () => {
     btn.addEventListener('mouseleave', set(false));
   });
 
-  // ===== تطبيق الحساسية من الإعدادات =====
-  if (controls.sensitivity) {
-    if (controls.sensitivity.moveSpeed) tank.speed = controls.sensitivity.moveSpeed;
+  if (controls.sensitivity && controls.sensitivity.moveSpeed) {
+    tank.speed = controls.sensitivity.moveSpeed;
+  }
+
+  // ===== دوال مساعدة =====
+  function createExplosion(x, y, color) {
+    explosions.push({ x, y, radius: 5, maxRadius: 30, life: 20, color: color || '#ff7b00' });
+  }
+
+  function updateHUD() {
+    const hpFill = document.getElementById('hpFill');
+    const hpText = document.getElementById('hpText');
+    const scoreText = document.getElementById('scoreText');
+
+    if (hpFill) hpFill.style.width = Math.max(0, (tank.hp / tank.maxHp) * 100) + '%';
+    if (hpText) hpText.textContent = Math.max(0, tank.hp);
+    if (scoreText) scoreText.textContent = combat.score;
   }
 
   // ===== حلقة اللعبة =====
@@ -102,37 +118,101 @@ window.addEventListener('DOMContentLoaded', () => {
     const dt = Math.min((now - lastTime) / 16.67, maxDT);
     lastTime = now;
 
-    // تحديث
-    tank.update(dt, input);
+    if (gameState === 'playing') {
+      // تحديث اللاعب
+      tank.update(dt, input);
+      combat.resolveTankObstacles(tank, obstacles);
 
-    // حدود الشاشة
-    tank.x = Math.max(0, Math.min(canvas.width - tank.width, tank.x));
-    tank.y = Math.max(0, Math.min(canvas.height - tank.height, tank.y));
+      // حدود الشاشة
+      tank.x = Math.max(0, Math.min(canvas.width - tank.width, tank.x));
+      tank.y = Math.max(0, Math.min(canvas.height - tank.height, tank.y));
 
-    // رسم
+      // إطلاق النار
+      fireCooldown -= dt;
+      if (input.fire && fireCooldown <= 0) {
+        fireCooldown = FIRE_INTERVAL;
+        const muzzleX = tank.x + tank.width / 2 + Math.sin(tank.rotation) * 35;
+        const muzzleY = tank.y + tank.height / 2 - Math.cos(tank.rotation) * 35;
+        projectiles.push(new Projectile(muzzleX, muzzleY, tank.rotation, 'player'));
+        combat.shotsFired++;
+      }
+
+      // تحديث الأعداء
+      enemies.forEach(e => e.update(dt, tank, projectiles));
+
+      // تحديث القذائف
+      projectiles.forEach(p => p.update());
+      projectiles = projectiles.filter(p => p.active &&
+        p.x > -50 && p.x < canvas.width + 50 &&
+        p.y > -50 && p.y < canvas.height + 50);
+
+      // معالجة الاصطدامات
+      combat.processProjectileHits(
+        projectiles, enemies, tank, obstacles,
+        (x, y, isHit) => createExplosion(x, y, isHit ? '#ff7b00' : '#666'),
+        (enemy) => createExplosion(enemy.x + enemy.width / 2, enemy.y + enemy.height / 2, '#dc2626')
+      );
+
+      // فحص حالة اللعبة
+      gameState = combat.checkGameState(tank, enemies);
+      if (gameState !== 'playing') {
+        setTimeout(() => {
+          alert(gameState === 'win'
+            ? `🏆 فوز! النقاط: ${combat.score} | الدقة: ${combat.getAccuracy()}%`
+            : `💀 خسارة! النقاط: ${combat.score}`);
+          if (gameState === 'win') {
+            tank.hp = tank.maxHp;
+            enemies.forEach(e => { e.active = true; e.hp = e.maxHp; });
+            projectiles = [];
+            gameState = 'playing';
+          }
+        }, 100);
+      }
+    }
+
+    // تحديث الانفجارات
+    explosions.forEach(ex => {
+      ex.radius += (ex.maxRadius - ex.radius) * 0.15;
+      ex.life--;
+    });
+    explosions = explosions.filter(ex => ex.life > 0);
+
+    // ===== الرسم =====
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     map.draw(ctx);
-    tank.draw(ctx);
 
+    enemies.forEach(e => e.draw(ctx));
+    projectiles.forEach(p => p.draw(ctx));
+    if (gameState === 'playing' || tank.hp > 0) tank.draw(ctx);
+
+    // رسم الانفجارات
+    explosions.forEach(ex => {
+      ctx.globalAlpha = ex.life / 20;
+      ctx.fillStyle = ex.color;
+      ctx.beginPath();
+      ctx.arc(ex.x, ex.y, ex.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    });
+
+    updateHUD();
     requestAnimationFrame(gameLoop);
   }
 
   requestAnimationFrame(gameLoop);
 
-  // ===== حفظ تلقائي دوري =====
+  // حفظ تلقائي
   const autoSaveMs = (cfg.gameplay && cfg.gameplay.autoSaveInterval) || 30000;
   setInterval(() => {
     if (window.COA && window.COA.saves) {
       window.COA.saves.autoSave({
         tank: { x: tank.x, y: tank.y, rotation: tank.rotation, hp: tank.hp },
+        score: combat.score,
+        kills: combat.kills,
         mapId: mapCfg.id || 'map_01'
       });
     }
   }, autoSaveMs);
 
-  console.log('🎮 Clash of Armored — Game initialized', {
-    dpr,
-    spawn,
-    canvasSize: { w: canvas.width, h: canvas.height }
-  });
+  console.log('🎮 Clash of Armored — Combat system ready');
 });
